@@ -7,7 +7,7 @@
 ## 供应商与工具
 
 **供应商 (Provider)**:
-提供上游能力的外部服务方,同时是过滤参数中可整组引用的名字:供应商名为 `deepseek`、`bocha`、`context7`、`grep_app`、`wikidata`。
+提供上游能力的外部服务方,同时是过滤参数中可整组引用的名字:供应商名为 `deepseek`、`bocha`、`context7`、`grep_app`。
 _Avoid_: 渠道、来源、服务商、backend
 
 **工具 (Tool)**:
@@ -19,7 +19,7 @@ _Avoid_: 函数、接口、API
 _Avoid_: 自建工具、本地工具
 
 **透传工具 (Pass-through tool)**:
-名称、描述与参数均取自上游 MCP 端点的工具,来自 `context7`、`wikidata`、`grep_app` 三个供应商。
+名称、描述与参数均取自上游 MCP 端点的工具,来自 `context7`、`grep_app` 两个供应商。
 _Avoid_: 动态工具、代理工具
 
 **主供应商 / 备用供应商 (Primary / Fallback provider)**:
