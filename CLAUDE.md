@@ -19,7 +19,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 构建与测试
 
-项目尚处于初始化阶段,尚无源码、构建脚本或 CI 配置。构建、运行、测试(含单测)与 lint 命令在代码落地后补充到本节,不要臆造。
+需要 Go 1.25 或更高版本（SDK 的最低要求）。
+
+- 构建:`go build ./...`
+- 运行:`go run ./cmd/agent-utils-cn`(默认监听 `127.0.0.1:18081`)
+- 静态检查:`go vet ./...`
+- 格式化检查:`gofmt -l .`
+- 单元/集成测试:`go test ./...`
+- 竞态检查(需要 CGO 与 C 编译器):`CGO_ENABLED=1 go test -race ./...`
+- 构建镜像:`docker build -t agent-utils-cn .`
+
+国内网络下拉取依赖需先设置 `GOPROXY=https://goproxy.cn,direct`。
+
+测试只经由 MCP 协议边界断言行为,上游全部使用 `httptest` 假服务,不访问真实网络。
+真实上游联调时直接注入环境变量,不要把它们写进配置文件或提交到仓库。
+
+## 目录结构
+
+- `cmd/agent-utils-cn`:进程入口、信号处理与优雅关闭。
+- `internal/config`:启动参数、环境变量、YAML 三层配置解析。
+- `internal/provider`:供应商定义与透传供应商的 MCP 客户端。
+- `internal/filter`:`includes` / `excludes` 解析与可见性计算。
+- `internal/upstream`:DeepSeek、博查的 HTTP 调用、兜底判定与错误解析。
+- `internal/tools`:四个固定工具的定义与处理器;工具描述集中在本包 `definitions.go`。
+- `internal/server`:MCP 服务装配、按请求生成工具面、健康检查。
+- `internal/version`:可通过链接器注入的版本号。
 
 ## Agent skills
 
