@@ -26,23 +26,49 @@
 export GOPROXY=https://goproxy.cn,direct
 ```
 
-### 从源码构建
+### 从 Go 源码构建（本地使用）
 
 ```bash
+git clone https://github.com/bob56621517/deepseek-search-fetch-mcp.git
+cd deepseek-search-fetch-mcp
+
 # Linux / macOS
-go build -o bin/deepseek-search-fetch-mcp ./cmd/deepseek-search-fetch-mcp
+go build -o deepseek-search-fetch-mcp ./cmd/deepseek-search-fetch-mcp
 
 # Windows
-go build -o bin/deepseek-search-fetch-mcp.exe ./cmd/deepseek-search-fetch-mcp
+go build -o deepseek-search-fetch-mcp.exe ./cmd/deepseek-search-fetch-mcp
 ```
 
-### 使用 go install
+二进制会生成在当前目录，直接运行即可：
+
+```bash
+./deepseek-search-fetch-mcp server        # Linux / macOS
+.\deepseek-search-fetch-mcp.exe server    # Windows
+```
+
+如需指定版本号，可加 `-ldflags "-X main.version=v1.2.3"`（不传则为 `dev+local`）。
+
+### 使用 go install（一条命令下载并安装）
+
+`go install` 会从模块代理下载源码、编译，并把可执行文件安装到 `$(go env GOPATH)/bin`：
 
 ```bash
 go install github.com/bob56621517/deepseek-search-fetch-mcp/cmd/deepseek-search-fetch-mcp@latest
 ```
 
-可执行文件位于 `$(go env GOPATH)/bin`。
+- `@latest` 取最新版本；也可写 `@v1.2.3` 指定版本，或 `@main` 取主分支
+- 产物位于 `$(go env GOPATH)/bin`（Windows 通常是 `%USERPROFILE%\go\bin`）
+- 把该目录加入 `PATH` 后即可直接运行：
+
+```bash
+export PATH="$(go env GOPATH)/bin:$PATH"   # Linux / macOS
+deepseek-search-fetch-mcp server
+```
+
+```powershell
+$env:Path += ";$(go env GOPATH)\bin"       # Windows PowerShell
+deepseek-search-fetch-mcp.exe server
+```
 
 ### 启动 MCP 服务
 

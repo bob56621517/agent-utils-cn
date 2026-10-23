@@ -26,23 +26,49 @@ Exposes DeepSeek's official web search and fetch capabilities as an MCP server, 
 export GOPROXY=https://goproxy.cn,direct
 ```
 
-### Build from source
+### Build from Go Source (local use)
 
 ```bash
+git clone https://github.com/bob56621517/deepseek-search-fetch-mcp.git
+cd deepseek-search-fetch-mcp
+
 # Linux / macOS
-go build -o bin/deepseek-search-fetch-mcp ./cmd/deepseek-search-fetch-mcp
+go build -o deepseek-search-fetch-mcp ./cmd/deepseek-search-fetch-mcp
 
 # Windows
-go build -o bin/deepseek-search-fetch-mcp.exe ./cmd/deepseek-search-fetch-mcp
+go build -o deepseek-search-fetch-mcp.exe ./cmd/deepseek-search-fetch-mcp
 ```
 
-### Install with go install
+The binary is created in the current directory; run it directly:
+
+```bash
+./deepseek-search-fetch-mcp server        # Linux / macOS
+.\deepseek-search-fetch-mcp.exe server    # Windows
+```
+
+To set a version, add `-ldflags "-X main.version=v1.2.3"` (otherwise it is `dev+local`).
+
+### Install with go install (download and install in one command)
+
+`go install` downloads the source from the module proxy, compiles it, and installs the binary into `$(go env GOPATH)/bin`:
 
 ```bash
 go install github.com/bob56621517/deepseek-search-fetch-mcp/cmd/deepseek-search-fetch-mcp@latest
 ```
 
-The binary is placed in `$(go env GOPATH)/bin`.
+- `@latest` picks the newest version; use `@v1.2.3` for a specific version or `@main` for the main branch
+- The binary is placed in `$(go env GOPATH)/bin` (on Windows usually `%USERPROFILE%\go\bin`)
+- Add that directory to `PATH` to run it directly:
+
+```bash
+export PATH="$(go env GOPATH)/bin:$PATH"   # Linux / macOS
+deepseek-search-fetch-mcp server
+```
+
+```powershell
+$env:Path += ";$(go env GOPATH)\bin"       # Windows PowerShell
+deepseek-search-fetch-mcp.exe server
+```
 
 ### Start the MCP server
 
