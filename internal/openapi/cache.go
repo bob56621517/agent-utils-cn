@@ -1,0 +1,505 @@
+package openapi
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+const (
+	// DefaultCacheTTL 是缓存条目的默认有效期。
+	DefaultCacheTTL = 30 * time.Minute
+	// DefaultCacheMaxBytes 是缓存文件的默认容量上限。
+	DefaultCacheMaxBytes int64 = 1 << 30
+	// cachePruneInterval 限制自动清理的最小间隔。
+	cachePruneInterval = time.Minute
+)
+
+// CacheOptions 是 SQLite 缓存的打开参数。
+type CacheOptions struct {
+	Path     string
+	TTL      time.Duration
+	MaxBytes int64
+}
+
+// CachedPage 是缓存中的一个网页条目。
+type CachedPage struct {
+	URL           string
+	Title         string
+	Content       string
+	ContentLength int
+	Summary       string
+	SummaryQuery  string
+	ContentSource string
+	ContentAt     time.Time
+	SummaryAt     time.Time
+	HasSummary    bool
+}
+
+// Cache 是进程内共享、落盘到 SQLite 的网页缓存。
+// 方法在缓存为 nil 时也安全，便于在缓存不可用时降级运行。
+type Cache struct {
+	db       *sql.DB
+	ttl      time.Duration
+	maxBytes int64
+	clock    func() time.Time
+
+	pruneMu   sync.Mutex
+	lastPrune time.Time
+}
+
+// OpenCache 打开（必要时创建）SQLite 缓存库。
+func OpenCache(opts CacheOptions) (*Cache, error) {
+	if strings.TrimSpace(opts.Path) == "" {
+		return nil, errors.New("缓存路径不能为空")
+	}
+	if opts.TTL <= 0 {
+		opts.TTL = DefaultCacheTTL
+	}
+	if opts.MaxBytes <= 0 {
+		opts.MaxBytes = DefaultCacheMaxBytes
+	}
+	if err := os.MkdirAll(filepath.Dir(opts.Path), 0o700); err != nil {
+		return nil, fmt.Errorf("创建缓存目录失败: %w", err)
+	}
+
+	dsn := filepath.ToSlash(opts.Path) +
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("打开缓存库失败: %w", err)
+	}
+	// 单连接足以支撑本地缓存，同时避免多连接之间的锁竞争。
+	db.SetMaxOpenConns(1)
+	db.SetConnMaxLifetime(0)
+
+	c := &Cache{db: db, ttl: opts.TTL, maxBytes: opts.MaxBytes, clock: time.Now}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("连接缓存库失败: %w", err)
+	}
+	if err := c.initSchema(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	_ = os.Chmod(opts.Path, 0o600)
+
+	// 启动时清理一次过期条目；失败不影响主功能。
+	_ = c.Prune(context.Background())
+	c.lastPrune = c.now()
+	return c, nil
+}
+
+func (c *Cache) initSchema(ctx context.Context) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS web_cache (
+			url            TEXT PRIMARY KEY,
+			title          TEXT NOT NULL DEFAULT '',
+			content        TEXT NOT NULL DEFAULT '',
+			summary        TEXT NOT NULL DEFAULT '',
+			summary_query  TEXT NOT NULL DEFAULT '',
+			content_source TEXT NOT NULL DEFAULT '',
+			content_at     INTEGER NOT NULL DEFAULT 0,
+			summary_at     INTEGER NOT NULL DEFAULT 0,
+			last_used      INTEGER NOT NULL DEFAULT 0,
+			size_bytes     INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_web_cache_last_used ON web_cache(last_used)`,
+		`CREATE INDEX IF NOT EXISTS idx_web_cache_content_at ON web_cache(content_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_web_cache_summary_at ON web_cache(summary_at)`,
+	}
+	for _, stmt := range statements {
+		if _, err := c.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("初始化缓存表失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// Close 关闭缓存库。
+func (c *Cache) Close() error {
+	if c == nil || c.db == nil {
+		return nil
+	}
+	return c.db.Close()
+}
+
+// Flush 清空所有缓存，并回收 SQLite 文件空间。
+func (c *Cache) Flush(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	if _, err := c.db.ExecContext(ctx, `DELETE FROM web_cache`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetSummary 读取未过期的摘要。调用方不需要再判断 TTL。
+func (c *Cache) GetSummary(ctx context.Context, rawURL string) (CachedPage, bool, error) {
+	if c == nil {
+		return CachedPage{}, false, nil
+	}
+	key := cacheKey(rawURL)
+	cutoff := c.cutoff()
+	var (
+		page      CachedPage
+		contentAt int64
+		summaryAt int64
+	)
+	err := c.db.QueryRowContext(ctx, `
+		SELECT title, summary, summary_query, length(content), content_at, summary_at
+		FROM web_cache
+		WHERE url = ? AND summary_at >= ?`, key, cutoff).Scan(
+		&page.Title, &page.Summary, &page.SummaryQuery, &page.ContentLength, &contentAt, &summaryAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CachedPage{}, false, nil
+	}
+	if err != nil {
+		return CachedPage{}, false, err
+	}
+	if page.Summary == "" {
+		return CachedPage{}, false, nil
+	}
+	page.URL = key
+	page.ContentAt = time.Unix(contentAt, 0)
+	page.SummaryAt = time.Unix(summaryAt, 0)
+	page.HasSummary = true
+	c.touch(ctx, key)
+	return page, true, nil
+}
+
+// GetContent 读取未过期的正文，并顺带返回是否有可用的摘要。
+func (c *Cache) GetContent(ctx context.Context, rawURL string) (CachedPage, bool, error) {
+	if c == nil {
+		return CachedPage{}, false, nil
+	}
+	key := cacheKey(rawURL)
+	cutoff := c.cutoff()
+	var (
+		page      CachedPage
+		contentAt int64
+		summaryAt int64
+	)
+	err := c.db.QueryRowContext(ctx, `
+		SELECT title, content, length(content), content_at, summary, summary_at
+		FROM web_cache
+		WHERE url = ? AND content_at >= ?`, key, cutoff).Scan(
+		&page.Title, &page.Content, &page.ContentLength, &contentAt, &page.Summary, &summaryAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CachedPage{}, false, nil
+	}
+	if err != nil {
+		return CachedPage{}, false, err
+	}
+	if page.Content == "" {
+		return CachedPage{}, false, nil
+	}
+	page.URL = key
+	page.ContentAt = time.Unix(contentAt, 0)
+	page.SummaryAt = time.Unix(summaryAt, 0)
+	page.HasSummary = page.Summary != "" && summaryAt >= cutoff
+	c.touch(ctx, key)
+	return page, true, nil
+}
+
+// PutSearch 写入一次搜索返回的条目。写入失败由调用方决定是否忽略。
+func (c *Cache) PutSearch(ctx context.Context, query string, pages []CachedPage) error {
+	if c == nil || len(pages) == 0 {
+		return nil
+	}
+	now := c.now()
+	cutoff := c.cutoff()
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, page := range pages {
+		if strings.TrimSpace(page.URL) == "" {
+			continue
+		}
+		key := cacheKey(page.URL)
+		final, err := mergeSearchEntry(ctx, tx, key, query, page, now, cutoff)
+		if err != nil {
+			return err
+		}
+		if err := upsertEntry(ctx, tx, final, now); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	c.maybePrune(ctx)
+	return nil
+}
+
+// PutFetch 写入一次抓取结果。fetch 的正文比 search 的更完整，总是覆盖正文；
+// clearSummary 为 true 时同时丢弃旧摘要（强制刷新场景）。
+func (c *Cache) PutFetch(ctx context.Context, page CachedPage, clearSummary bool) error {
+	if c == nil || strings.TrimSpace(page.URL) == "" || page.Content == "" {
+		return nil
+	}
+	now := c.now()
+	key := cacheKey(page.URL)
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		existing  CachedPage
+		summaryAt int64
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT title, summary, summary_query, summary_at
+		FROM web_cache WHERE url = ?`, key).Scan(
+		&existing.Title, &existing.Summary, &existing.SummaryQuery, &summaryAt,
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	final := CachedPage{
+		URL:           key,
+		Title:         page.Title,
+		Content:       page.Content,
+		ContentSource: "fetch",
+		ContentAt:     now,
+		Summary:       existing.Summary,
+		SummaryQuery:  existing.SummaryQuery,
+		SummaryAt:     time.Unix(summaryAt, 0),
+	}
+	if final.Title == "" {
+		final.Title = existing.Title
+	}
+	if clearSummary || summaryAt < c.cutoff() {
+		final.Summary = ""
+		final.SummaryQuery = ""
+		final.SummaryAt = time.Time{}
+	}
+	if err := upsertEntry(ctx, tx, final, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	c.maybePrune(ctx)
+	return nil
+}
+
+func mergeSearchEntry(ctx context.Context, tx *sql.Tx, key, query string, page CachedPage, now time.Time, cutoff int64) (CachedPage, error) {
+	var (
+		existing    CachedPage
+		contentAt   int64
+		summaryAt   int64
+		contentSrc  string
+		existingHas bool
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT title, content, summary, summary_query, content_source, content_at, summary_at
+		FROM web_cache WHERE url = ?`, key).Scan(
+		&existing.Title, &existing.Content, &existing.Summary, &existing.SummaryQuery,
+		&contentSrc, &contentAt, &summaryAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		existingHas = false
+	} else if err != nil {
+		return CachedPage{}, err
+	} else {
+		existingHas = true
+		existing.URL = key
+		existing.ContentSource = contentSrc
+		existing.ContentAt = time.Unix(contentAt, 0)
+		existing.SummaryAt = time.Unix(summaryAt, 0)
+	}
+
+	final := CachedPage{URL: key, Title: page.Title}
+	if page.Content != "" {
+		// fetch 的正文更完整；缓存未过期时不要用 search 的正文把它降级。
+		keepFetched := existingHas &&
+			existing.ContentSource == "fetch" &&
+			existing.Content != "" &&
+			contentAt >= cutoff
+		if keepFetched {
+			final.Content = existing.Content
+			final.ContentSource = existing.ContentSource
+			final.ContentAt = existing.ContentAt
+		} else {
+			final.Content = page.Content
+			final.ContentSource = "search"
+			final.ContentAt = now
+		}
+	} else if existingHas {
+		final.Content = existing.Content
+		final.ContentSource = existing.ContentSource
+		final.ContentAt = existing.ContentAt
+	}
+	if final.Title == "" {
+		final.Title = existing.Title
+	}
+
+	if page.Summary != "" {
+		final.Summary = page.Summary
+		final.SummaryQuery = query
+		final.SummaryAt = now
+	} else if existingHas && summaryAt >= cutoff {
+		final.Summary = existing.Summary
+		final.SummaryQuery = existing.SummaryQuery
+		final.SummaryAt = existing.SummaryAt
+	}
+	return final, nil
+}
+
+func upsertEntry(ctx context.Context, tx *sql.Tx, page CachedPage, now time.Time) error {
+	contentAt := int64(0)
+	if !page.ContentAt.IsZero() {
+		contentAt = page.ContentAt.Unix()
+	}
+	summaryAt := int64(0)
+	if !page.SummaryAt.IsZero() {
+		summaryAt = page.SummaryAt.Unix()
+	}
+	size := int64(len(page.Title) + len(page.Content) + len(page.Summary))
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO web_cache
+			(url, title, content, summary, summary_query, content_source, content_at, summary_at, last_used, size_bytes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(url) DO UPDATE SET
+			title          = excluded.title,
+			content        = excluded.content,
+			summary        = excluded.summary,
+			summary_query  = excluded.summary_query,
+			content_source = excluded.content_source,
+			content_at     = excluded.content_at,
+			summary_at     = excluded.summary_at,
+			last_used      = excluded.last_used,
+			size_bytes     = excluded.size_bytes`,
+		page.URL, page.Title, page.Content, page.Summary, page.SummaryQuery,
+		page.ContentSource, contentAt, summaryAt, now.Unix(), size,
+	)
+	return err
+}
+
+func (c *Cache) touch(ctx context.Context, key string) {
+	_, _ = c.db.ExecContext(ctx, `UPDATE web_cache SET last_used = ? WHERE url = ?`, c.now().Unix(), key)
+}
+
+func (c *Cache) now() time.Time {
+	if c == nil || c.clock == nil {
+		return time.Now()
+	}
+	return c.clock()
+}
+
+func (c *Cache) cutoff() int64 {
+	return c.now().Add(-c.ttl).Unix()
+}
+
+func (c *Cache) maybePrune(ctx context.Context) {
+	if c == nil {
+		return
+	}
+	now := c.now()
+	c.pruneMu.Lock()
+	if now.Sub(c.lastPrune) < cachePruneInterval {
+		c.pruneMu.Unlock()
+		return
+	}
+	c.lastPrune = now
+	c.pruneMu.Unlock()
+	_ = c.Prune(ctx)
+}
+
+// Prune 删除过期条目，并按容量淘汰最久未使用的条目。
+func (c *Cache) Prune(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	cutoff := c.cutoff()
+	if _, err := c.db.ExecContext(ctx, `
+		DELETE FROM web_cache WHERE content_at < ? AND summary_at < ?`, cutoff, cutoff); err != nil {
+		return err
+	}
+
+	var total int64
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(size_bytes), 0) FROM web_cache`).Scan(&total); err != nil {
+		return err
+	}
+	if total <= c.maxBytes {
+		return nil
+	}
+
+	// 按最久未使用顺序收集刚好能腾出超额的条目，避免一次删掉过多。
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT url, size_bytes FROM web_cache ORDER BY last_used ASC, url ASC`)
+	if err != nil {
+		return err
+	}
+	over := total - c.maxBytes
+	var (
+		freed   int64
+		victims []string
+	)
+	for rows.Next() && freed < over {
+		var (
+			url  string
+			size int64
+		)
+		if err := rows.Scan(&url, &size); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		victims = append(victims, url)
+		freed += size
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(victims) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(victims)), ",")
+	args := make([]any, len(victims))
+	for i, url := range victims {
+		args[i] = url
+	}
+	_, err = c.db.ExecContext(ctx, `DELETE FROM web_cache WHERE url IN (`+placeholders+`)`, args...)
+	return err
+}
+
+// cacheKey 去掉 fragment，并统一 scheme/host 大小写；path 与 query 保持原样。
+func cacheKey(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.Fragment = ""
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	return u.String()
+}
