@@ -128,7 +128,7 @@ func TestListTools(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	sort.Strings(names)
-	want := []string{"web_ext_search", "web_fetch"}
+	want := []string{"web_ext_fetch", "web_ext_search"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("工具列表不符\n got: %v\nwant: %v", names, want)
 	}
@@ -197,7 +197,7 @@ func TestCallToolError(t *testing.T) {
 	session, ctx := env.connect(t)
 
 	res, err := session.CallTool(ctx, &sdkmcp.CallToolParams{
-		Name:      "web_fetch",
+		Name:      "web_ext_fetch",
 		Arguments: map[string]any{"url": "https://example.com/a"},
 	})
 	if err != nil {

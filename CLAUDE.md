@@ -12,10 +12,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Go 项目,module 为 `github.com/bob56621517/deepseek-search-fetch-mcp`。
 - MCP server,使用官方 Go SDK `github.com/modelcontextprotocol/go-sdk`,以 Streamable HTTP 形式暴露。
-- 只暴露 DeepSeek 官方的两个工具:`web_ext_search`、`web_fetch`。
+- 只暴露 DeepSeek 官方的两个工具:`web_ext_search`、`web_ext_fetch`。
 - 搜索工具支持包装层参数 `summary`(默认 `false`):`false` 返回 `snippet`,`true` 返回 `summary`;两个字段始终存在,同一条结果只有一个非空。
 - 搜索 `count` 默认 10;低于 5 自动按 5 处理;超过 50 报错。
-- 搜索结果不返回 `content` 与 `site_icon`;网页正文统一通过 `web_fetch` 获取。
+- 搜索结果不返回 `content` 与 `site_icon`;网页正文统一通过 `web_ext_fetch` 获取。
 - 接口契约以 `api/openapi.yaml` 为准。
 - 唯一凭据是 DeepSeek API Key。
 - 默认监听端口 `18081`。

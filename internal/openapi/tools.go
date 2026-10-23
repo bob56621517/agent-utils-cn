@@ -104,9 +104,9 @@ func searchTool(client *Client) Tool {
 
 func fetchTool(client *Client) Tool {
 	return Tool{
-		Name: "web_fetch",
-		Description: "抓取单个网页，返回页面标题与 Markdown 格式正文；" +
-			"结果受目标站点可用性和访问策略影响。只读请求，按成功请求次数计费。",
+		Name: "web_ext_fetch",
+		Description: `扩展网页抓取。使用浏览器渲染读取页面，适合 JavaScript 渲染、单页应用和动态加载内容的网页。
+返回 title 与 content：title 为页面标题，缺失时为空字符串；content 为 Markdown 正文。`,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -115,7 +115,7 @@ func fetchTool(client *Client) Tool {
 					"minLength":   1,
 					"maxLength":   8192,
 					"format":      "uri",
-					"description": "要抓取的网页地址，必须为包含主机名的 HTTP/HTTPS URL，且不能携带用户名或密码。",
+					"description": "要抓取的网页 URL，必须是包含主机名的 HTTP/HTTPS 地址，不能携带用户名或密码；长度不超过 8192 字符。",
 				},
 			},
 			"required": []string{"url"},

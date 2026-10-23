@@ -15,7 +15,7 @@ _Avoid_: 检索、查询接口
 _Avoid_: 下载、爬取
 
 **工具 (Tool)**:
-MCP 客户端可调用的一项能力。当前固定为 `web_ext_search` 与 `web_fetch`;`web_ext_search` 是扩展搜索,支持站点、语言、时间范围等过滤。
+MCP 客户端可调用的一项能力。当前固定为 `web_ext_search` 与 `web_ext_fetch`;`web_ext_search` 是扩展搜索,支持站点、语言、时间范围等过滤。
 _Avoid_: 函数、接口、API
 
 **上游 (Upstream)**:

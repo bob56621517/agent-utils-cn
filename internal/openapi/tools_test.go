@@ -91,7 +91,7 @@ func TestToolDefinitions(t *testing.T) {
 		t.Fatalf("工具数量应为 2，实际 %d", len(all))
 	}
 	search := findTool(t, all, "web_ext_search")
-	fetch := findTool(t, all, "web_fetch")
+	fetch := findTool(t, all, "web_ext_fetch")
 	if search.Description == "" || fetch.Description == "" {
 		t.Fatal("工具描述不能为空")
 	}
@@ -278,7 +278,7 @@ func TestFetchSuccess(t *testing.T) {
 	all, up := newTools(t)
 	up.respond(200, `{"title":"Example","content":"# Example"}`)
 
-	body, err := findTool(t, all, "web_fetch").Call(
+	body, err := findTool(t, all, "web_ext_fetch").Call(
 		context.Background(),
 		json.RawMessage(`{"url":"https://example.com/article"}`),
 	)
@@ -311,7 +311,7 @@ func TestFetchValidation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			all, up := newTools(t)
-			_, err := findTool(t, all, "web_fetch").Call(context.Background(), json.RawMessage(tc.args))
+			_, err := findTool(t, all, "web_ext_fetch").Call(context.Background(), json.RawMessage(tc.args))
 			if err == nil {
 				t.Fatal("应返回参数错误")
 			}
