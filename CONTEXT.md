@@ -7,15 +7,23 @@
 ## 能力与工具
 
 **Search (搜索)**:
-按 query 检索网页,返回结构化结果列表。对应上游 `POST /v1/tools/search`。默认返回 `snippet`;`summary=true` 时返回长摘要,两者互斥。搜索不返回网页正文,正文统一通过 Fetch 获取。
+按 query 检索网页,返回结构化结果列表。对应上游 `POST /v1/tools/search`。只返回 `snippet`,不返回 `summary`、`content` 与 `site_icon`。搜索时会向上游请求 `need_content=true`,把每条结果的正文与摘要写入缓存,供后续 Fetch 使用。
 _Avoid_: 检索、查询接口
 
 **Fetch (抓取)**:
-抓取单个网页,返回页面标题与 Markdown 正文。对应上游 `POST /v1/tools/fetch`。
+抓取单个网页,返回页面标题与 Markdown 正文。对应上游 `POST /v1/tools/fetch`。默认缓存优先;`summary=true` 时优先返回搜索缓存的摘要,没有摘要则回退为正文;MCP 工具的正文通过 `offset`/`limit` 按 rune 分页返回,CLI 则一次性返回完整正文;`refresh=true` 跳过缓存并刷新。
 _Avoid_: 下载、爬取
 
+**缓存 (Cache)**:
+进程间共享的 SQLite 缓存,固定文件 `~/.deepseek_search_fetch/cache.db`。以规范化 URL 为键,分别记录正文与摘要及各自时间戳;TTL 与容量可配置。缓存故障只记日志,不影响搜索与抓取主流程。
+_Avoid_: 存储、数据库
+
+**命令行 (CLI)**:
+同一可执行文件的直接调用形态,包含 `server`、`search`、`fetch`、`flushall` 四个子命令。CLI 模式 stdout 只输出 JSON,日志只写日志文件。
+_Avoid_: 脚本、工具集
+
 **工具 (Tool)**:
-MCP 客户端可调用的一项能力。当前固定为 `web_ext_search` 与 `web_ext_fetch`;`web_ext_search` 是扩展搜索,支持站点、语言、时间范围等过滤。
+MCP 客户端可调用的一项能力。当前固定为 `web_ext_search` 与 `web_ext_fetch`;`web_ext_search` 是扩展搜索,支持站点、语言、时间范围等过滤;`web_ext_fetch` 同时承担缓存摘要读取与正文分页。
 _Avoid_: 函数、接口、API
 
 **上游 (Upstream)**:
@@ -37,7 +45,7 @@ _Avoid_: 连接、上下文
 _Avoid_: 错误码、异常
 
 **配置文件 (Config file)**:
-固定路径 `~/.deepseek_search_fetch/config.json`,承载 `deepseek_api_key`、`deepseek_api_url`、`server_host` 与 `server_port`,首次启动时自动创建。
+固定路径 `~/.deepseek_search_fetch/config.json`,承载 `deepseek_api_key`、`deepseek_api_url`、`server_host`、`server_port`、超时参数与缓存参数(`cache_ttl`、`cache_max_bytes`)。首次启动时自动创建。
 _Avoid_: 设置、环境
 
 ## 运行时
