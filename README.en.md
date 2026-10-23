@@ -228,7 +228,7 @@ Calls upstream search directly and prints JSON.
 
 - Returns `summary` by default, not content
 - `--content` also returns `content`
-- `--count` defaults to 10; 0 or omitted means 10; 1–4 is treated as 5; anything above 50 is an error
+- `--count` defaults to 10; 0 or omitted means 10; 1–4 is treated as 5; negative values or anything above 50 is an error
 - Results are written to the cache; **search itself never uses cached results** (it always queries upstream)
 - Options go before the query
 
@@ -336,7 +336,7 @@ Field reference:
 | `source` | `cache` (cache hit) or `upstream` (live fetch) |
 | `cachedAt` | Cache timestamp, UTC RFC 3339 |
 | `summaryQuery` | Search query that produced the summary |
-| `truncated` | `true` when the summary exceeds 8000 runes |
+| `hint` | Advisory message; explains that content was returned because the summary is unavailable (missed or longer than 8000 runes) |
 
 ### `flushall`
 
@@ -417,7 +417,7 @@ Input:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `query` | string | required | 1–128 characters, must not be all whitespace |
-| `count` | integer | 10 | 1–50; 1–4 is treated as 5; 0 or omitted means 10; above 50 is an error |
+| `count` | integer | 10 | 1–50; 1–4 is treated as 5; 0 or omitted means 10; negative values or above 50 is an error |
 | `ori_question` | string/null | none | Original question that triggered the search, 1–128 characters |
 | `localization` | string | empty | IP address used to localize results |
 
@@ -501,6 +501,8 @@ Summary mode hit:
 
 On a summary miss it falls back to content: `kind="content"`, `hasSummary=false`, plus a `hint`. The fallback ignores the requested `offset`/`limit` and returns 8000 characters from position 0.
 
+A cached summary longer than 8000 runes is **never truncated**; it is treated as a miss and content is returned instead, so a returned summary is always complete.
+
 ### Recommended workflow
 
 1. Use `web_ext_search` to get candidate URLs and `snippet`s.
@@ -543,6 +545,8 @@ For example:
 - `https://example.com/a#other`
 
 both map to `https://example.com/a`.
+
+The `url` field in `web_ext_fetch` responses also uses the normalized value, so the same URL produces the same output whether `source=upstream` or `source=cache`.
 
 ### TTL and capacity
 
@@ -602,7 +606,7 @@ Write rules:
 
 - When fetch returns non-empty content it always overwrites, with `content_source=fetch`
 - An unexpired old summary is kept by default
-- `refresh=true` clears the old summary
+- `refresh=true` clears the old summary; this happens even when the upstream returns an empty body and no new content is written
 - Nothing is written when upstream returns empty content
 
 ### When the cache is unavailable

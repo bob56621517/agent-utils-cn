@@ -2,6 +2,7 @@ package openapi
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -240,6 +241,83 @@ func TestCacheEviction(t *testing.T) {
 	}
 	if _, ok, _ := cache.GetContent(ctx, urls[0]); ok {
 		t.Fatal("最久未使用的条目应被淘汰")
+	}
+}
+
+func TestPutSearchSkipsEmptyEntry(t *testing.T) {
+	cache := newTestCache(t, time.Minute, 1<<20)
+	ctx := context.Background()
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: "https://example.com/empty", Title: "只有标题",
+	}}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	var count int
+	if err := cache.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM web_cache WHERE url = ?`, "https://example.com/empty").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("空正文且空摘要不应写入缓存，实际 %d 行", count)
+	}
+}
+
+func TestClearSummaryKeepsContent(t *testing.T) {
+	cache := newTestCache(t, time.Minute, 1<<20)
+	ctx := context.Background()
+	const url = "https://example.com/a"
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: url, Title: "标题", Content: "正文内容", Summary: "摘要",
+	}}); err != nil {
+		t.Fatalf("预热缓存失败: %v", err)
+	}
+	if err := cache.ClearSummary(ctx, url); err != nil {
+		t.Fatalf("清除摘要失败: %v", err)
+	}
+	if _, ok, err := cache.GetSummary(ctx, url); err != nil || ok {
+		t.Fatalf("摘要应被清除: ok=%v err=%v", ok, err)
+	}
+	if page, ok, err := cache.GetContent(ctx, url); err != nil || !ok || page.Content != "正文内容" {
+		t.Fatalf("正文应保留: ok=%v err=%v %#v", ok, err, page)
+	}
+
+	var size int64
+	if err := cache.db.QueryRowContext(ctx,
+		`SELECT size_bytes FROM web_cache WHERE url = ?`, url).Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(len("标题") + len("正文内容")); size != want {
+		t.Fatalf("清除摘要后 size_bytes 应为 %d，实际 %d", want, size)
+	}
+}
+
+func TestPruneDeletesManyVictims(t *testing.T) {
+	cache := newTestCache(t, time.Hour, 100)
+	ctx := context.Background()
+
+	pages := make([]CachedPage, 0, 600)
+	for i := 0; i < 600; i++ {
+		pages = append(pages, CachedPage{
+			URL:     fmt.Sprintf("https://example.com/%d", i),
+			Title:   "t",
+			Content: "c",
+		})
+	}
+	if err := cache.PutSearch(ctx, "q", pages); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	if err := cache.Prune(ctx); err != nil {
+		t.Fatalf("批量清理失败: %v", err)
+	}
+	var total int64
+	if err := cache.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(size_bytes), 0) FROM web_cache`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total > 100 {
+		t.Fatalf("清理后仍超出容量: %d", total)
 	}
 }
 

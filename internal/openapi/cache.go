@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +23,8 @@ const (
 	DefaultCacheMaxBytes int64 = 1 << 30
 	// cachePruneInterval 限制自动清理的最小间隔。
 	cachePruneInterval = time.Minute
+	// pruneDeleteBatch 限制单条 DELETE 语句绑定的参数数量，避免触发 SQLite 上限。
+	pruneDeleteBatch = 500
 )
 
 // CacheOptions 是 SQLite 缓存的打开参数。
@@ -29,6 +32,8 @@ type CacheOptions struct {
 	Path     string
 	TTL      time.Duration
 	MaxBytes int64
+	// Logger 用于记录清理失败等非致命错误；为 nil 时使用默认 logger。
+	Logger *slog.Logger
 }
 
 // CachedPage 是缓存中的一个网页条目。
@@ -52,6 +57,7 @@ type Cache struct {
 	ttl      time.Duration
 	maxBytes int64
 	clock    func() time.Time
+	logger   *slog.Logger
 
 	pruneMu   sync.Mutex
 	lastPrune time.Time
@@ -82,7 +88,11 @@ func OpenCache(opts CacheOptions) (*Cache, error) {
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(0)
 
-	c := &Cache{db: db, ttl: opts.TTL, maxBytes: opts.MaxBytes, clock: time.Now}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	c := &Cache{db: db, ttl: opts.TTL, maxBytes: opts.MaxBytes, clock: time.Now, logger: logger}
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("连接缓存库失败: %w", err)
@@ -94,7 +104,9 @@ func OpenCache(opts CacheOptions) (*Cache, error) {
 	_ = os.Chmod(opts.Path, 0o600)
 
 	// 启动时清理一次过期条目；失败不影响主功能。
-	_ = c.Prune(context.Background())
+	if err := c.Prune(context.Background()); err != nil {
+		logger.Warn("缓存清理失败", "err", err)
+	}
 	c.lastPrune = c.now()
 	return c, nil
 }
@@ -240,6 +252,10 @@ func (c *Cache) PutSearch(ctx context.Context, query string, pages []CachedPage)
 		if err != nil {
 			return err
 		}
+		// 上游偶尔返回既无正文也无摘要的条目，写入只会留下空行。
+		if final.Content == "" && final.Summary == "" {
+			continue
+		}
 		if err := upsertEntry(ctx, tx, final, now); err != nil {
 			return err
 		}
@@ -305,6 +321,21 @@ func (c *Cache) PutFetch(ctx context.Context, page CachedPage, clearSummary bool
 	}
 	c.maybePrune(ctx)
 	return nil
+}
+
+// ClearSummary 丢弃指定 URL 的摘要，保留正文。
+// 用于 refresh 时上游返回空正文、无法写入新条目的场景。
+func (c *Cache) ClearSummary(ctx context.Context, rawURL string) error {
+	if c == nil {
+		return nil
+	}
+	key := cacheKey(rawURL)
+	_, err := c.db.ExecContext(ctx, `
+		UPDATE web_cache
+		SET summary = '', summary_query = '', summary_at = 0,
+		    size_bytes = length(CAST(title AS BLOB)) + length(CAST(content AS BLOB))
+		WHERE url = ?`, key)
+	return err
 }
 
 func mergeSearchEntry(ctx context.Context, tx *sql.Tx, key, query string, page CachedPage, now time.Time, cutoff int64) (CachedPage, error) {
@@ -427,7 +458,9 @@ func (c *Cache) maybePrune(ctx context.Context) {
 	}
 	c.lastPrune = now
 	c.pruneMu.Unlock()
-	_ = c.Prune(ctx)
+	if err := c.Prune(ctx); err != nil && c.logger != nil {
+		c.logger.Warn("缓存清理失败", "err", err)
+	}
 }
 
 // Prune 删除过期条目，并按容量淘汰最久未使用的条目。
@@ -483,13 +516,24 @@ func (c *Cache) Prune(ctx context.Context) error {
 	if len(victims) == 0 {
 		return nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(victims)), ",")
-	args := make([]any, len(victims))
-	for i, url := range victims {
-		args[i] = url
+	// 分批删除，避免单条 SQL 的绑定参数数量超过 SQLite 上限。
+	for start := 0; start < len(victims); start += pruneDeleteBatch {
+		end := start + pruneDeleteBatch
+		if end > len(victims) {
+			end = len(victims)
+		}
+		batch := victims[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, url := range batch {
+			args[i] = url
+		}
+		if _, err := c.db.ExecContext(ctx,
+			`DELETE FROM web_cache WHERE url IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
 	}
-	_, err = c.db.ExecContext(ctx, `DELETE FROM web_cache WHERE url IN (`+placeholders+`)`, args...)
-	return err
+	return nil
 }
 
 // cacheKey 去掉 fragment，并统一 scheme/host 大小写；path 与 query 保持原样。

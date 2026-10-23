@@ -20,8 +20,9 @@ const (
 	defaultFetchLimit = 8000
 	maxFetchLimit     = 16000
 
-	// maxSummaryRunes 是单条摘要返回的兜底上限，实测最大约 6k。
-	maxSummaryRunes = 8000
+	// maxUsableSummaryRunes 是 summary 模式可接受的摘要长度上限。
+	// 超过上限时不截断，直接视为未命中并回退为正文，保证返回的摘要始终完整。
+	maxUsableSummaryRunes = 8000
 )
 
 // Tool 是 OpenAPI 工具层对外暴露的一项能力。
@@ -76,7 +77,7 @@ func searchTool(client *Client, cache *Cache, logger *slog.Logger) Tool {
 					"minimum":     0,
 					"maximum":     maxSearchCount,
 					"default":     defaultSearchCount,
-					"description": "返回结果条数，默认 10，最少 5，最多 50。简单事实 5；一般 10；长尾冷门 25。subagent 或独立子任务可适当增大。",
+					"description": "返回结果条数，默认 10，最少 5，最多 50；0 或省略为 10，1-4 按 5 处理，负数报错。简单事实 5；一般 10；长尾冷门 25。subagent 或独立子任务可适当增大。",
 				},
 				"ori_question": map[string]any{
 					"type":        []any{"string", "null"},
@@ -117,7 +118,7 @@ func fetchTool(client *Client, cache *Cache, logger *slog.Logger) Tool {
 		Name: "web_ext_fetch",
 		Description: `扩展网页抓取。默认先查本地缓存，命中时直接返回；未命中或 refresh=true 时才调用上游。
 summary=false：返回正文，按 offset/limit 分页。
-summary=true：返回此前 web_ext_search 缓存的摘要，不分页；缓存中没有摘要时回退为正文，并通过 hasSummary=false 与 hint 标明。
+summary=true：返回此前 web_ext_search 缓存的完整摘要，不分页；缓存中没有摘要，或摘要超过 8000 个字符时，回退为正文，并通过 hasSummary=false 与 hint 标明。
 响应统一包含 contentLength（正文总字符数）、offset（偏移）、length（本次返回字符数）、hasSummary；正文模式还包含 hasMore 与 nextOffset。`,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -142,10 +143,10 @@ summary=true：返回此前 web_ext_search 缓存的摘要，不分页；缓存�
 				},
 				"limit": map[string]any{
 					"type":        "integer",
-					"minimum":     1,
+					"minimum":     0,
 					"maximum":     maxFetchLimit,
 					"default":     defaultFetchLimit,
-					"description": "正文分页长度，按字符（rune）计，默认 8000，最大 16000；summary=true 时忽略。",
+					"description": "正文分页长度，按字符（rune）计，默认 8000，最大 16000；0 视为 8000；summary=true 时忽略。",
 				},
 				"refresh": map[string]any{
 					"type":        "boolean",
@@ -182,6 +183,9 @@ func parseSearchArgs(raw json.RawMessage) (searchArgs, error) {
 	}
 	if utf8.RuneCountInString(args.Query) > 128 {
 		return args, errors.New("参数 query 不能超过 128 个字符")
+	}
+	if args.Count < 0 {
+		return args, errors.New("参数 count 不能小于 0")
 	}
 	if args.Count == 0 {
 		args.Count = defaultSearchCount
@@ -384,6 +388,9 @@ func SearchDirect(ctx context.Context, client *Client, cache *Cache, logger *slo
 	if utf8.RuneCountInString(opts.Query) > 128 {
 		return nil, errors.New("参数 query 不能超过 128 个字符")
 	}
+	if opts.Count < 0 {
+		return nil, errors.New("参数 count 不能小于 0")
+	}
 	if opts.Count == 0 {
 		opts.Count = defaultSearchCount
 	}
@@ -444,7 +451,6 @@ type summaryOutput struct {
 	Length        int    `json:"length"`
 	HasSummary    bool   `json:"hasSummary"`
 	SummaryQuery  string `json:"summaryQuery,omitempty"`
-	Truncated     bool   `json:"truncated,omitempty"`
 	Source        string `json:"source"`
 	CachedAt      string `json:"cachedAt,omitempty"`
 }
@@ -470,19 +476,18 @@ func fetchSummary(ctx context.Context, client *Client, cache *Cache, logger *slo
 		page, ok, err := cache.GetSummary(ctx, opts.URL)
 		if err != nil {
 			logger.Warn("读取摘要缓存失败", "url", opts.URL, "err", err)
-		} else if ok {
-			summary, truncated := truncateRunes(page.Summary, maxSummaryRunes)
+		} else if ok && utf8.RuneCountInString(page.Summary) <= maxUsableSummaryRunes {
+			// 摘要始终完整返回；超过上限的摘要按未命中处理，回退为正文。
 			out := summaryOutput{
 				Kind:          "summary",
-				URL:           opts.URL,
+				URL:           page.URL,
 				Title:         page.Title,
-				Summary:       summary,
+				Summary:       page.Summary,
 				ContentLength: page.ContentLength,
 				Offset:        0,
-				Length:        utf8.RuneCountInString(summary),
+				Length:        utf8.RuneCountInString(page.Summary),
 				HasSummary:    true,
 				SummaryQuery:  page.SummaryQuery,
-				Truncated:     truncated,
 				Source:        "cache",
 				CachedAt:      formatTime(page.SummaryAt),
 			}
@@ -494,11 +499,16 @@ func fetchSummary(ctx context.Context, client *Client, cache *Cache, logger *slo
 	if err != nil {
 		return nil, err
 	}
-	const hint = "该 URL 没有可用的缓存摘要；已返回正文。如需摘要，请先调用 web_ext_search。"
-	if opts.FullContent {
-		return buildFullContentOutput(page, source, false, hint)
+	// loadContent 可能从缓存里读到刚写入或并发写入的摘要，这里以实际状态为准。
+	hasSummary := page.HasSummary
+	hint := ""
+	if !hasSummary {
+		hint = "该 URL 没有可用的缓存摘要；已返回正文。如需摘要，请先调用 web_ext_search。"
 	}
-	return buildContentOutput(page, 0, defaultFetchLimit, source, false, hint)
+	if opts.FullContent {
+		return buildFullContentOutput(page, source, hasSummary, hint)
+	}
+	return buildContentOutput(page, 0, defaultFetchLimit, source, hasSummary, hint)
 }
 
 func fetchContent(ctx context.Context, client *Client, cache *Cache, logger *slog.Logger, opts FetchOptions) ([]byte, error) {
@@ -519,6 +529,8 @@ func loadContent(ctx context.Context, client *Client, cache *Cache, logger *slog
 		if err != nil {
 			logger.Warn("读取正文缓存失败", "url", opts.URL, "err", err)
 		} else if ok {
+			// 过长的摘要不作为可用摘要，避免调用方以为拿到的是完整内容。
+			page.HasSummary = page.HasSummary && utf8.RuneCountInString(page.Summary) <= maxUsableSummaryRunes
 			return page, "cache", nil
 		}
 	}
@@ -532,18 +544,27 @@ func loadContent(ctx context.Context, client *Client, cache *Cache, logger *slog
 		return CachedPage{}, "", fmt.Errorf("解析抓取结果失败: %w", err)
 	}
 	page := CachedPage{
-		URL:           opts.URL,
+		// 输出与缓存键保持一致，避免同一 URL 因大小写或 fragment 出现两种写法。
+		URL:           cacheKey(opts.URL),
 		Title:         resp.Title,
 		Content:       resp.Content,
 		ContentLength: utf8.RuneCountInString(resp.Content),
 		ContentAt:     time.Now(),
 	}
-	if cache != nil && resp.Content != "" {
-		if err := cache.PutFetch(ctx, page, opts.Refresh); err != nil {
-			logger.Warn("写入正文缓存失败", "url", opts.URL, "err", err)
+	if cache != nil {
+		if resp.Content != "" {
+			if err := cache.PutFetch(ctx, page, opts.Refresh); err != nil {
+				logger.Warn("写入正文缓存失败", "url", opts.URL, "err", err)
+			}
+		} else if opts.Refresh {
+			// 上游返回空正文时不写缓存，但 refresh 仍要丢弃旧摘要，避免继续返回过期摘要。
+			if err := cache.ClearSummary(ctx, opts.URL); err != nil {
+				logger.Warn("清除摘要缓存失败", "url", opts.URL, "err", err)
+			}
 		}
 		if !opts.Refresh {
-			if summary, ok, err := cache.GetSummary(ctx, opts.URL); err == nil && ok {
+			if summary, ok, err := cache.GetSummary(ctx, opts.URL); err == nil && ok &&
+				utf8.RuneCountInString(summary.Summary) <= maxUsableSummaryRunes {
 				page.HasSummary = true
 				page.Summary = summary.Summary
 				page.SummaryAt = summary.SummaryAt
@@ -622,19 +643,9 @@ func sliceRunes(s string, offset, limit int) (string, int) {
 	return string(runes[offset:end]), end - offset
 }
 
-func truncateRunes(s string, limit int) (string, bool) {
-	if limit <= 0 {
-		return "", s != ""
-	}
-	if utf8.RuneCountInString(s) <= limit {
-		return s, false
-	}
-	runes := []rune(s)
-	return string(runes[:limit]) + "…", true
-}
-
 func formatTime(t time.Time) string {
-	if t.IsZero() {
+	// Unix 0 表示缓存时间为空，不能输出成 1970-01-01。
+	if t.IsZero() || t.Unix() <= 0 {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)

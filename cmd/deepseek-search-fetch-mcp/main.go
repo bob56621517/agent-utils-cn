@@ -120,7 +120,7 @@ func serve(cfg config) error {
 	client := newAPIClient(cfg)
 	defer client.CloseIdleConnections()
 
-	cache, err := openCache(cfg)
+	cache, err := openCache(cfg, logger)
 	if err != nil {
 		logger.Warn("缓存不可用，将在无缓存模式下运行", "err", err)
 		cache = nil
@@ -182,7 +182,7 @@ func runSearch(args []string) error {
 	defer logCloser.Close()
 	client := newAPIClient(cfg)
 	defer client.CloseIdleConnections()
-	cache, err := openCache(cfg)
+	cache, err := openCache(cfg, logger)
 	if err != nil {
 		logger.Warn("缓存不可用，命令将在无缓存模式下运行", "err", err)
 	} else {
@@ -220,7 +220,7 @@ func runFetch(args []string) error {
 	defer logCloser.Close()
 	client := newAPIClient(cfg)
 	defer client.CloseIdleConnections()
-	cache, err := openCache(cfg)
+	cache, err := openCache(cfg, logger)
 	if err != nil {
 		logger.Warn("缓存不可用，命令将在无缓存模式下运行", "err", err)
 	} else {
@@ -252,7 +252,9 @@ func runFlushAll(args []string) error {
 	if err != nil {
 		return err
 	}
-	cache, err := openCache(cfg)
+	logger, logCloser := newCLILogger()
+	defer logCloser.Close()
+	cache, err := openCache(cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -275,7 +277,7 @@ func newAPIClient(cfg config) *openapi.Client {
 	})
 }
 
-func openCache(cfg config) (*openapi.Cache, error) {
+func openCache(cfg config, logger *slog.Logger) (*openapi.Cache, error) {
 	dir := dataDir()
 	if dir == "" {
 		return nil, errors.New("无法确定用户主目录，缓存不可用")
@@ -284,6 +286,7 @@ func openCache(cfg config) (*openapi.Cache, error) {
 		Path:     filepath.Join(dir, "cache.db"),
 		TTL:      cfg.cacheTTL,
 		MaxBytes: cfg.cacheMaxBytes,
+		Logger:   logger,
 	})
 }
 

@@ -228,7 +228,7 @@ deepseek-search-fetch-mcp server --host 0.0.0.0 --port 18081
 
 - 默认返回 `summary`，不返回正文
 - `--content` 额外返回 `content`
-- `--count` 默认 10；0 或省略为 10；1–4 按 5 处理；大于 50 报错
+- `--count` 默认 10；0 或省略为 10；1–4 按 5 处理；负数或大于 50 报错
 - 结果会写入缓存；**搜索本身不使用缓存结果**（每次都请求上游）
 - 参数写在 query 之前
 
@@ -336,7 +336,7 @@ deepseek-search-fetch-mcp fetch --refresh "https://example.com/article"
 | `source` | `cache`（命中缓存）或 `upstream`（实时抓取） |
 | `cachedAt` | 缓存时间，UTC RFC 3339 |
 | `summaryQuery` | 生成该摘要的搜索词 |
-| `truncated` | 摘要超过 8000 个字符（rune）时为 `true` |
+| `hint` | 提示信息；摘要不可用（未命中或超过 8000 个字符）时说明已回退正文 |
 
 ### `flushall`
 
@@ -417,7 +417,7 @@ deepseek-search-fetch-mcp server
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `query` | string | 必填 | 1–128 字符，不能全为空白 |
-| `count` | integer | 10 | 1–50；1–4 按 5 处理；0 或省略为 10；大于 50 报错 |
+| `count` | integer | 10 | 1–50；1–4 按 5 处理；0 或省略为 10；负数或大于 50 报错 |
 | `ori_question` | string/null | 无 | 触发搜索的原始问题，1–128 字符 |
 | `localization` | string | 空 | 用于本地化结果的 IP 地址 |
 
@@ -501,6 +501,8 @@ deepseek-search-fetch-mcp server
 
 摘要未命中时回退为正文：`kind="content"`、`hasSummary=false`，并带 `hint`。回退时忽略请求中的 `offset`/`limit`，从第 0 字符返回默认 8000 字符。
 
+缓存摘要超过 8000 个字符时**不会截断**，而是按未命中摘要处理并回退为正文，保证返回的摘要始终是完整内容。
+
 ### 推荐使用流程
 
 1. 用 `web_ext_search` 拿到候选 URL 与 `snippet`。
@@ -543,6 +545,8 @@ deepseek-search-fetch-mcp server
 - `https://example.com/a#other`
 
 都会映射到 `https://example.com/a`。
+
+`web_ext_fetch` 响应中的 `url` 也使用规范化后的值，因此同一 URL 无论 `source=upstream` 还是 `source=cache`，输出保持一致。
 
 ### TTL 与容量
 
@@ -602,7 +606,7 @@ web_ext_fetch(summary=true, refresh=true)
 
 - fetch 返回非空正文时，总是覆盖旧正文，`content_source=fetch`
 - 默认保留未过期的旧摘要
-- `refresh=true` 时清空旧摘要
+- `refresh=true` 时清空旧摘要；即使上游返回空正文、未写入新正文，旧摘要也会被清除
 - 上游返回空正文时不写缓存
 
 ### 缓存不可用时

@@ -67,6 +67,7 @@ type fileConfig struct {
 
 // loadConfig 按优先级读取配置：启动参数 > 环境变量 > 固定配置文件 > 默认值。
 // 配置只在启动时读取一次；首次启动时自动创建配置目录与配置文件。
+// 主要供测试复用 server 级参数解析；各子命令入口使用 loadConfigFor。
 func loadConfig(args []string, stderr io.Writer) (config, error) {
 	fs, values := newFlagSet("deepseek-search-fetch-mcp", stderr)
 	fs.StringVar(&values.host, "host", "", "监听地址")

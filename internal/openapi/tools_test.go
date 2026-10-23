@@ -124,6 +124,10 @@ func TestToolDefinitions(t *testing.T) {
 			t.Fatalf("fetch 缺少参数 %s", key)
 		}
 	}
+	limitSchema := fetchProps["limit"].(map[string]any)
+	if limitSchema["minimum"] != 0 {
+		t.Fatalf("limit 应允许 0（视为 8000），实际 schema: %#v", limitSchema)
+	}
 }
 
 func TestSearchSuccess(t *testing.T) {
@@ -250,6 +254,7 @@ func TestSearchValidation(t *testing.T) {
 		{"空 query", `{"query":"   "}`},
 		{"query 超长", fmt.Sprintf(`{"query":%q}`, strings.Repeat("中", 129))},
 		{"count 过大", `{"query":"q","count":51}`},
+		{"count 为负", `{"query":"q","count":-1}`},
 		{"ori_question 为空白", `{"query":"q","ori_question":"  "}`},
 	}
 	for _, tc := range cases {
@@ -490,6 +495,122 @@ func TestFetchRefresh(t *testing.T) {
 	}
 	if len(up.calls()) != 2 {
 		t.Fatalf("应执行一次搜索和一次抓取: %d", len(up.calls()))
+	}
+}
+
+func TestFetchOutputURLNormalized(t *testing.T) {
+	all, up, _ := newTools(t)
+	up.respond(200, `{"title":"T","content":"body"}`)
+	tool := findTool(t, all, "web_ext_fetch")
+	ctx := context.Background()
+	const requestURL = "https://EXAMPLE.com/A#Frag"
+
+	call := func() contentOutput {
+		t.Helper()
+		body, err := tool.Call(ctx, json.RawMessage(fmt.Sprintf(`{"url":%q}`, requestURL)))
+		if err != nil {
+			t.Fatalf("调用失败: %v", err)
+		}
+		var out contentOutput
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatalf("结果不是合法 JSON: %v (%s)", err, body)
+		}
+		return out
+	}
+
+	first := call()
+	if first.URL != "https://example.com/A" || first.Source != "upstream" {
+		t.Fatalf("上游结果应输出规范化 URL: %#v", first)
+	}
+	second := call()
+	if second.URL != first.URL || second.Source != "cache" {
+		t.Fatalf("缓存命中的 URL 应与上游一致: %#v", second)
+	}
+}
+
+func TestFetchRefreshEmptyContentClearsSummary(t *testing.T) {
+	all, up, cache := newTools(t)
+	ctx := context.Background()
+	const url = "https://example.com/empty-refresh"
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: url, Title: "T", Content: "old body", Summary: "old summary",
+	}}); err != nil {
+		t.Fatalf("预热缓存失败: %v", err)
+	}
+
+	up.respond(200, `{"title":"T","content":""}`)
+	body, err := findTool(t, all, "web_ext_fetch").Call(
+		ctx, json.RawMessage(fmt.Sprintf(`{"url":%q,"refresh":true}`, url)),
+	)
+	if err != nil {
+		t.Fatalf("强制刷新失败: %v", err)
+	}
+	var out contentOutput
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v (%s)", err, body)
+	}
+	if out.Content != "" || out.HasSummary || out.Source != "upstream" {
+		t.Fatalf("空正文刷新结果不符: %#v", out)
+	}
+	if _, ok, err := cache.GetSummary(ctx, url); err != nil || ok {
+		t.Fatalf("空正文刷新后旧摘要应被清除: ok=%v err=%v", ok, err)
+	}
+	if page, ok, err := cache.GetContent(ctx, url); err != nil || !ok || page.Content != "old body" {
+		t.Fatalf("空正文刷新不应写入新正文，旧正文应保留: ok=%v err=%v %#v", ok, err, page)
+	}
+}
+
+func TestFormatTimeZero(t *testing.T) {
+	if got := formatTime(time.Unix(0, 0)); got != "" {
+		t.Fatalf("Unix 0 应输出空字符串，实际 %q", got)
+	}
+}
+
+func TestFetchSummaryTooLongFallsBackToContent(t *testing.T) {
+	all, up, cache := newTools(t)
+	ctx := context.Background()
+	const url = "https://example.com/long-summary"
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: url, Title: "T", Content: "body", Summary: strings.Repeat("中", maxUsableSummaryRunes+1),
+	}}); err != nil {
+		t.Fatalf("预热缓存失败: %v", err)
+	}
+
+	body, err := findTool(t, all, "web_ext_fetch").Call(
+		ctx, json.RawMessage(fmt.Sprintf(`{"url":%q,"summary":true}`, url)),
+	)
+	if err != nil {
+		t.Fatalf("读取摘要失败: %v", err)
+	}
+	var out contentOutput
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v (%s)", err, body)
+	}
+	if out.Kind != "content" || out.Content != "body" || out.HasSummary || out.Hint == "" {
+		t.Fatalf("超长摘要应按未命中处理并回退正文: %#v", out)
+	}
+	if out.Source != "cache" {
+		t.Fatalf("正文应命中缓存: %#v", out)
+	}
+	if len(up.calls()) != 0 {
+		t.Fatalf("回退正文时不应请求上游: %d", len(up.calls()))
+	}
+
+	// summary=false 时，超长摘要也不应被标记为可用。
+	body, err = findTool(t, all, "web_ext_fetch").Call(
+		ctx, json.RawMessage(fmt.Sprintf(`{"url":%q}`, url)),
+	)
+	if err != nil {
+		t.Fatalf("读取正文失败: %v", err)
+	}
+	var content contentOutput
+	if err := json.Unmarshal(body, &content); err != nil {
+		t.Fatal(err)
+	}
+	if content.HasSummary {
+		t.Fatalf("超长摘要不应标记 hasSummary: %#v", content)
 	}
 }
 
