@@ -21,12 +21,15 @@ const (
 	dataDirName    = ".deepseek_search_fetch"
 	configFileName = "config.json"
 
-	defaultRequestTimeout          = 30 * time.Second
-	defaultHTTPMaxIdleConns        = 5
-	defaultHTTPMaxIdleConnsPerHost = 5
-	defaultHTTPIdleConnTimeout     = 90 * time.Second
-	defaultHTTPTLSHandshakeTimeout = 10 * time.Second
-	defaultResetConnectionOnError  = true
+	defaultRequestTimeout                = 30 * time.Second
+	defaultFetchTimeout                  = 60 * time.Second
+	defaultCacheTTL                      = 30 * time.Minute
+	defaultCacheMaxBytes           int64 = 1 << 30
+	defaultHTTPMaxIdleConns              = 5
+	defaultHTTPMaxIdleConnsPerHost       = 5
+	defaultHTTPIdleConnTimeout           = 90 * time.Second
+	defaultHTTPTLSHandshakeTimeout       = 10 * time.Second
+	defaultResetConnectionOnError        = true
 )
 
 type config struct {
@@ -36,6 +39,9 @@ type config struct {
 	port   int
 
 	requestTimeout          time.Duration
+	fetchTimeout            time.Duration
+	cacheTTL                time.Duration
+	cacheMaxBytes           int64
 	httpMaxIdleConns        int
 	httpMaxIdleConnsPerHost int
 	httpIdleConnTimeout     time.Duration
@@ -49,6 +55,9 @@ type fileConfig struct {
 	ServerHost              *string `json:"server_host"`
 	ServerPort              *int    `json:"server_port"`
 	RequestTimeout          *string `json:"request_timeout"`
+	FetchTimeout            *string `json:"fetch_timeout"`
+	CacheTTL                *string `json:"cache_ttl"`
+	CacheMaxBytes           *int64  `json:"cache_max_bytes"`
 	HTTPMaxIdleConns        *int    `json:"http_max_idle_conns"`
 	HTTPMaxIdleConnsPerHost *int    `json:"http_max_idle_conns_per_host"`
 	HTTPIdleConnTimeout     *string `json:"http_idle_conn_timeout"`
@@ -59,35 +68,51 @@ type fileConfig struct {
 // loadConfig 按优先级读取配置：启动参数 > 环境变量 > 固定配置文件 > 默认值。
 // 配置只在启动时读取一次；首次启动时自动创建配置目录与配置文件。
 func loadConfig(args []string, stderr io.Writer) (config, error) {
+	fs, values := newFlagSet("deepseek-search-fetch-mcp", stderr)
+	fs.StringVar(&values.host, "host", "", "监听地址")
+	fs.IntVar(&values.port, "port", 0, "监听端口")
+	fs.Usage = func() { printUsage(stderr) }
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+	if fs.NArg() > 0 {
+		return config{}, fmt.Errorf("未知参数: %s", strings.Join(fs.Args(), " "))
+	}
+	return loadConfigFor(fs, values, true)
+}
+
+// flagValues 保存各子命令 FlagSet 解析出的值。
+type flagValues struct {
+	apiKey string
+	apiURL string
+	host   string
+	port   int
+}
+
+func newFlagSet(name string, stderr io.Writer) (*flag.FlagSet, *flagValues) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	values := &flagValues{}
+	fs.StringVar(&values.apiKey, "deepseek-api-key", "", "DeepSeek API Key")
+	fs.StringVar(&values.apiURL, "deepseek-api-url", "", "DeepSeek API Base URL")
+	return fs, values
+}
+
+// loadConfigFor 在 FlagSet 解析完成后合并配置文件与环境变量。
+func loadConfigFor(fs *flag.FlagSet, values *flagValues, requireKey bool) (config, error) {
 	cfg := config{
 		apiURL:                  defaultAPIURL,
 		host:                    defaultHost,
 		port:                    defaultPort,
 		requestTimeout:          defaultRequestTimeout,
+		fetchTimeout:            defaultFetchTimeout,
+		cacheTTL:                defaultCacheTTL,
+		cacheMaxBytes:           defaultCacheMaxBytes,
 		httpMaxIdleConns:        defaultHTTPMaxIdleConns,
 		httpMaxIdleConnsPerHost: defaultHTTPMaxIdleConnsPerHost,
 		httpIdleConnTimeout:     defaultHTTPIdleConnTimeout,
 		httpTLSHandshakeTimeout: defaultHTTPTLSHandshakeTimeout,
 		resetConnectionOnError:  defaultResetConnectionOnError,
-	}
-
-	fs := flag.NewFlagSet("deepseek-search-fetch-mcp", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	var (
-		apiKey string
-		apiURL string
-		host   string
-		port   int
-	)
-	fs.StringVar(&apiKey, "deepseek-api-key", "", "DeepSeek API Key")
-	fs.StringVar(&apiURL, "deepseek-api-url", "", "DeepSeek API Base URL")
-	fs.StringVar(&host, "host", "", "监听地址")
-	fs.IntVar(&port, "port", 0, "监听端口")
-	if err := fs.Parse(args); err != nil {
-		return cfg, err
-	}
-	if fs.NArg() > 0 {
-		return cfg, fmt.Errorf("未知参数: %s", strings.Join(fs.Args(), " "))
 	}
 	setByFlag := make(map[string]bool)
 	fs.Visit(func(f *flag.Flag) { setByFlag[f.Name] = true })
@@ -128,22 +153,22 @@ func loadConfig(args []string, stderr io.Writer) (config, error) {
 	}
 
 	if setByFlag["deepseek-api-key"] {
-		cfg.apiKey = strings.TrimSpace(apiKey)
+		cfg.apiKey = strings.TrimSpace(values.apiKey)
 	}
 	if setByFlag["deepseek-api-url"] {
-		cfg.apiURL = strings.TrimSpace(apiURL)
+		cfg.apiURL = strings.TrimSpace(values.apiURL)
 	}
 	if setByFlag["host"] {
-		cfg.host = host
+		cfg.host = values.host
 	}
 	if setByFlag["port"] {
-		cfg.port = port
+		cfg.port = values.port
 	}
 
 	if err := validateConfig(&cfg); err != nil {
 		return cfg, err
 	}
-	if cfg.apiKey == "" {
+	if requireKey && cfg.apiKey == "" {
 		hint := "请设置 DEEPSEEK_API_KEY 或 --deepseek-api-key"
 		if path != "" {
 			hint += "，或写入 " + path + " 的 deepseek_api_key"
@@ -172,6 +197,23 @@ func applyFileConfig(cfg *config, file fileConfig) error {
 			return err
 		}
 		cfg.requestTimeout = d
+	}
+	if file.FetchTimeout != nil {
+		d, err := parseDuration("fetch_timeout", *file.FetchTimeout)
+		if err != nil {
+			return err
+		}
+		cfg.fetchTimeout = d
+	}
+	if file.CacheTTL != nil {
+		d, err := parseDuration("cache_ttl", *file.CacheTTL)
+		if err != nil {
+			return err
+		}
+		cfg.cacheTTL = d
+	}
+	if file.CacheMaxBytes != nil {
+		cfg.cacheMaxBytes = *file.CacheMaxBytes
 	}
 	if file.HTTPMaxIdleConns != nil {
 		cfg.httpMaxIdleConns = *file.HTTPMaxIdleConns
@@ -232,6 +274,15 @@ func validateConfig(cfg *config) error {
 	if cfg.requestTimeout <= 0 {
 		return fmt.Errorf("request_timeout 必须大于 0，当前为 %s", cfg.requestTimeout)
 	}
+	if cfg.fetchTimeout <= 0 {
+		return fmt.Errorf("fetch_timeout 必须大于 0，当前为 %s", cfg.fetchTimeout)
+	}
+	if cfg.cacheTTL <= 0 {
+		return fmt.Errorf("cache_ttl 必须大于 0，当前为 %s", cfg.cacheTTL)
+	}
+	if cfg.cacheMaxBytes < 1<<20 {
+		return fmt.Errorf("cache_max_bytes 不能小于 1048576，当前为 %d", cfg.cacheMaxBytes)
+	}
 	if cfg.httpMaxIdleConns < 1 {
 		return fmt.Errorf("http_max_idle_conns 必须大于等于 1，当前为 %d", cfg.httpMaxIdleConns)
 	}
@@ -271,6 +322,9 @@ func ensureConfigFile() (string, error) {
 		ServerHost              string `json:"server_host"`
 		ServerPort              int    `json:"server_port"`
 		RequestTimeout          string `json:"request_timeout"`
+		FetchTimeout            string `json:"fetch_timeout"`
+		CacheTTL                string `json:"cache_ttl"`
+		CacheMaxBytes           int64  `json:"cache_max_bytes"`
 		HTTPMaxIdleConns        int    `json:"http_max_idle_conns"`
 		HTTPMaxIdleConnsPerHost int    `json:"http_max_idle_conns_per_host"`
 		HTTPIdleConnTimeout     string `json:"http_idle_conn_timeout"`
@@ -282,6 +336,9 @@ func ensureConfigFile() (string, error) {
 		ServerHost:              defaultHost,
 		ServerPort:              defaultPort,
 		RequestTimeout:          durationText(defaultRequestTimeout),
+		FetchTimeout:            durationText(defaultFetchTimeout),
+		CacheTTL:                durationText(defaultCacheTTL),
+		CacheMaxBytes:           defaultCacheMaxBytes,
 		HTTPMaxIdleConns:        defaultHTTPMaxIdleConns,
 		HTTPMaxIdleConnsPerHost: defaultHTTPMaxIdleConnsPerHost,
 		HTTPIdleConnTimeout:     durationText(defaultHTTPIdleConnTimeout),

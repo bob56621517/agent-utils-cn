@@ -16,6 +16,7 @@ const serviceName = "deepseek-search-fetch-mcp"
 // Options 是 MCP 层的装配参数。
 type Options struct {
 	Client  *openapi.Client
+	Cache   *openapi.Cache
 	Logger  *slog.Logger
 	Version string
 }
@@ -39,7 +40,7 @@ func New(opts Options) *Server {
 			Logger:       logger,
 		},
 	)
-	for _, tool := range openapi.Tools(opts.Client) {
+	for _, tool := range openapi.Tools(opts.Client, opts.Cache, logger) {
 		srv.AddTool(
 			&sdkmcp.Tool{
 				Name:        tool.Name,

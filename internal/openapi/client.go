@@ -20,7 +20,10 @@ const (
 
 // Options 是上游 HTTP 客户端的调优参数。
 type Options struct {
-	Timeout             time.Duration
+	// Timeout 用于 Search 等常规请求。
+	Timeout time.Duration
+	// FetchTimeout 用于抓取请求。抓取需要浏览器渲染，耗时明显高于搜索。
+	FetchTimeout        time.Duration
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
 	IdleConnTimeout     time.Duration
@@ -34,6 +37,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		Timeout:             30 * time.Second,
+		FetchTimeout:        60 * time.Second,
 		MaxIdleConns:        5,
 		MaxIdleConnsPerHost: 5,
 		IdleConnTimeout:     90 * time.Second,
@@ -49,6 +53,7 @@ type Client struct {
 	http         *http.Client
 	transport    *http.Transport
 	timeout      time.Duration
+	fetchTimeout time.Duration
 	resetOnError bool
 }
 
@@ -59,12 +64,17 @@ func NewClient(baseURL, apiKey string, opts Options) *Client {
 		baseURL = defaultBaseURL
 	}
 	transport := newTransport(opts)
+	fetchTimeout := opts.FetchTimeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = opts.Timeout
+	}
 	return &Client{
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		apiKey:       apiKey,
 		http:         &http.Client{Transport: transport},
 		transport:    transport,
 		timeout:      opts.Timeout,
+		fetchTimeout: fetchTimeout,
 		resetOnError: opts.ResetOnError,
 	}
 }
@@ -104,27 +114,30 @@ type SearchRequest struct {
 	Count        int     `json:"count,omitempty"`
 	OriQuestion  *string `json:"ori_question,omitempty"`
 	Localization string  `json:"localization,omitempty"`
+	// NeedContent 为 true 时请求上游同时返回网页正文，用于预热本地缓存。
+	NeedContent bool `json:"need_content,omitempty"`
 }
 
 // Search 调用搜索接口，成功时原样返回上游 JSON。
 func (c *Client) Search(ctx context.Context, req SearchRequest) ([]byte, error) {
-	return c.post(ctx, "/v1/tools/search", req)
+	return c.post(ctx, "/v1/tools/search", req, c.timeout)
 }
 
 // Fetch 调用抓取接口，成功时原样返回上游 JSON。
+// 抓取需要浏览器渲染，使用独立的、更长的超时。
 func (c *Client) Fetch(ctx context.Context, targetURL string) ([]byte, error) {
 	return c.post(ctx, "/v1/tools/fetch", struct {
 		URL string `json:"url"`
-	}{URL: targetURL})
+	}{URL: targetURL}, c.fetchTimeout)
 }
 
-func (c *Client) post(ctx context.Context, path string, payload any) ([]byte, error) {
+func (c *Client) post(ctx context.Context, path string, payload any, timeout time.Duration) ([]byte, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("构造请求失败: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))

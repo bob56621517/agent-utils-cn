@@ -58,6 +58,9 @@ func TestLoadFromFixedConfigFile(t *testing.T) {
 		"server_host": "0.0.0.0",
 		"server_port": 18090,
 		"request_timeout": "45s",
+		"fetch_timeout": "75s",
+		"cache_ttl": "45m",
+		"cache_max_bytes": 2097152,
 		"http_max_idle_conns": 8,
 		"http_max_idle_conns_per_host": 4,
 		"http_idle_conn_timeout": "60s",
@@ -73,6 +76,9 @@ func TestLoadFromFixedConfigFile(t *testing.T) {
 		t.Fatalf("配置文件未正确读取: %#v", cfg)
 	}
 	if cfg.requestTimeout != 45*time.Second ||
+		cfg.fetchTimeout != 75*time.Second ||
+		cfg.cacheTTL != 45*time.Minute ||
+		cfg.cacheMaxBytes != 2097152 ||
 		cfg.httpMaxIdleConns != 8 ||
 		cfg.httpMaxIdleConnsPerHost != 4 ||
 		cfg.httpIdleConnTimeout != 60*time.Second ||
@@ -154,6 +160,15 @@ func TestFirstRunCreatesConfigFile(t *testing.T) {
 	if file["request_timeout"] != durationText(defaultRequestTimeout) {
 		t.Fatalf("模板中的 request_timeout 不符: %s", data)
 	}
+	if file["fetch_timeout"] != durationText(defaultFetchTimeout) {
+		t.Fatalf("模板中的 fetch_timeout 不符: %s", data)
+	}
+	if file["cache_ttl"] != durationText(defaultCacheTTL) {
+		t.Fatalf("模板中的 cache_ttl 不符: %s", data)
+	}
+	if file["cache_max_bytes"] != float64(defaultCacheMaxBytes) {
+		t.Fatalf("模板中的 cache_max_bytes 不符: %s", data)
+	}
 	if file["http_max_idle_conns"] != float64(defaultHTTPMaxIdleConns) {
 		t.Fatalf("模板中的 http_max_idle_conns 不符: %s", data)
 	}
@@ -226,6 +241,37 @@ func TestInvalidDuration(t *testing.T) {
 	_, err := loadConfig(nil, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "request_timeout") {
 		t.Fatalf("非法时长应报错: %v", err)
+	}
+}
+
+func TestInvalidFetchDuration(t *testing.T) {
+	home := isolateHome(t)
+	writeConfigFile(t, home, `{"deepseek_api_key":"k","fetch_timeout":"abc"}`)
+
+	_, err := loadConfig(nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "fetch_timeout") {
+		t.Fatalf("非法抓取超时应报错: %v", err)
+	}
+}
+
+func TestInvalidCacheSettings(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"非法 TTL", `{"deepseek_api_key":"k","cache_ttl":"abc"}`, "cache_ttl"},
+		{"容量过小", `{"deepseek_api_key":"k","cache_max_bytes":1}`, "cache_max_bytes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := isolateHome(t)
+			writeConfigFile(t, home, tc.body)
+			_, err := loadConfig(nil, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("应报告 %s 配置错误: %v", tc.want, err)
+			}
+		})
 	}
 }
 

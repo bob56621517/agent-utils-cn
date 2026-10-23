@@ -1,0 +1,261 @@
+package openapi
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func newTestCache(t *testing.T, ttl time.Duration, maxBytes int64) *Cache {
+	t.Helper()
+	cache, err := OpenCache(CacheOptions{
+		Path:     filepath.Join(t.TempDir(), "cache.db"),
+		TTL:      ttl,
+		MaxBytes: maxBytes,
+	})
+	if err != nil {
+		t.Fatalf("打开缓存失败: %v", err)
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	return cache
+}
+
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (f *fakeClock) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.now
+}
+
+func (f *fakeClock) Advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.now = f.now.Add(d)
+}
+
+func TestCacheSearchRoundTrip(t *testing.T) {
+	cache := newTestCache(t, 30*time.Minute, 1<<20)
+	ctx := context.Background()
+
+	err := cache.PutSearch(ctx, "q1", []CachedPage{
+		{URL: "https://example.com/a#section", Title: "A", Content: "hello world", Summary: "short summary"},
+		{URL: "https://example.com/b", Title: "B", Summary: "only summary"},
+	})
+	if err != nil {
+		t.Fatalf("写入缓存失败: %v", err)
+	}
+
+	summary, ok, err := cache.GetSummary(ctx, "https://example.com/a")
+	if err != nil || !ok {
+		t.Fatalf("摘要应命中: ok=%v err=%v", ok, err)
+	}
+	if summary.Summary != "short summary" || summary.SummaryQuery != "q1" || summary.ContentLength != 11 {
+		t.Fatalf("摘要内容不符: %#v", summary)
+	}
+
+	content, ok, err := cache.GetContent(ctx, "https://EXAMPLE.com/a#other")
+	if err != nil || !ok {
+		t.Fatalf("正文应命中且忽略 fragment/host 大小写: ok=%v err=%v", ok, err)
+	}
+	if content.Content != "hello world" || !content.HasSummary {
+		t.Fatalf("正文内容不符: %#v", content)
+	}
+
+	if _, ok, _ := cache.GetContent(ctx, "https://example.com/b"); ok {
+		t.Fatal("空正文不应视为缓存命中")
+	}
+	if _, ok, _ := cache.GetSummary(ctx, "https://example.com/missing"); ok {
+		t.Fatal("不存在的 URL 不应命中")
+	}
+}
+
+func TestCacheFetchPreferredOverSearch(t *testing.T) {
+	cache := newTestCache(t, 30*time.Minute, 1<<20)
+	ctx := context.Background()
+	const url = "https://example.com/article"
+
+	if err := cache.PutSearch(ctx, "q1", []CachedPage{{
+		URL: url, Title: "T1", Content: "search body", Summary: "summary1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.PutFetch(ctx, CachedPage{URL: url, Title: "T2", Content: "fetch body longer"}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	page, ok, err := cache.GetContent(ctx, url)
+	if err != nil || !ok {
+		t.Fatalf("正文应命中: ok=%v err=%v", ok, err)
+	}
+	if page.Content != "fetch body longer" || page.Title != "T2" || !page.HasSummary || page.Summary != "summary1" {
+		t.Fatalf("fetch 结果应保留并携带旧摘要: %#v", page)
+	}
+
+	// 后续搜索不应把较短的 search 正文覆盖到 fetch 正文上，但摘要应更新。
+	if err := cache.PutSearch(ctx, "q2", []CachedPage{{
+		URL: url, Title: "T3", Content: "search body 2", Summary: "summary2",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	page, _, _ = cache.GetContent(ctx, url)
+	if page.Content != "fetch body longer" {
+		t.Fatalf("search 不应覆盖 fetch 正文: %#v", page)
+	}
+	summary, ok, _ := cache.GetSummary(ctx, url)
+	if !ok || summary.Summary != "summary2" || summary.SummaryQuery != "q2" {
+		t.Fatalf("摘要应更新为最新搜索: %#v", summary)
+	}
+}
+
+func TestCacheTTL(t *testing.T) {
+	cache := newTestCache(t, 30*time.Minute, 1<<20)
+	clock := &fakeClock{now: time.Now()}
+	cache.clock = clock.Now
+	ctx := context.Background()
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: "https://example.com/a", Title: "A", Content: "body", Summary: "summary",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := cache.GetSummary(ctx, "https://example.com/a"); !ok {
+		t.Fatal("未过期时应命中")
+	}
+
+	clock.Advance(31 * time.Minute)
+	if _, ok, _ := cache.GetSummary(ctx, "https://example.com/a"); ok {
+		t.Fatal("过期摘要不应命中")
+	}
+	if _, ok, _ := cache.GetContent(ctx, "https://example.com/a"); ok {
+		t.Fatal("过期正文不应命中")
+	}
+}
+
+func TestCacheIndependentTimestamps(t *testing.T) {
+	cache := newTestCache(t, 30*time.Minute, 1<<20)
+	clock := &fakeClock{now: time.Now()}
+	cache.clock = clock.Now
+	ctx := context.Background()
+	const url = "https://example.com/a"
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: url, Title: "A", Content: "old body", Summary: "summary",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(20 * time.Minute)
+	if err := cache.PutFetch(ctx, CachedPage{URL: url, Title: "A", Content: "new body"}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// T0+31m：摘要已过期，正文在 T0+20m 刷新，仍然有效。
+	clock.Advance(11 * time.Minute)
+	if _, ok, _ := cache.GetSummary(ctx, url); ok {
+		t.Fatal("摘要应按自己的时间戳过期")
+	}
+	page, ok, _ := cache.GetContent(ctx, url)
+	if !ok || page.Content != "new body" || page.HasSummary {
+		t.Fatalf("正文仍应有效且摘要已过期: %#v ok=%v", page, ok)
+	}
+}
+
+func TestCacheClearSummaryOnRefresh(t *testing.T) {
+	cache := newTestCache(t, 30*time.Minute, 1<<20)
+	ctx := context.Background()
+	const url = "https://example.com/a"
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: url, Title: "A", Content: "body", Summary: "summary",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.PutFetch(ctx, CachedPage{URL: url, Title: "A", Content: "fresh body"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := cache.GetSummary(ctx, url); ok {
+		t.Fatal("强制刷新后摘要应被清除")
+	}
+	if page, ok, _ := cache.GetContent(ctx, url); !ok || page.Content != "fresh body" {
+		t.Fatalf("强制刷新后正文应更新: %#v ok=%v", page, ok)
+	}
+}
+
+func TestCacheFlush(t *testing.T) {
+	cache := newTestCache(t, 30*time.Minute, 1<<20)
+	ctx := context.Background()
+
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{
+		URL: "https://example.com/a", Title: "A", Content: "body", Summary: "summary",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Flush(ctx); err != nil {
+		t.Fatalf("清空缓存失败: %v", err)
+	}
+	if _, ok, _ := cache.GetSummary(ctx, "https://example.com/a"); ok {
+		t.Fatal("清空后不应命中摘要")
+	}
+	if _, ok, _ := cache.GetContent(ctx, "https://example.com/a"); ok {
+		t.Fatal("清空后不应命中正文")
+	}
+}
+
+func TestCacheEviction(t *testing.T) {
+	cache := newTestCache(t, time.Hour, 250)
+	clock := &fakeClock{now: time.Now()}
+	cache.clock = clock.Now
+	ctx := context.Background()
+
+	urls := []string{
+		"https://example.com/1",
+		"https://example.com/2",
+		"https://example.com/3",
+	}
+	for _, url := range urls {
+		clock.Advance(time.Second)
+		if err := cache.PutSearch(ctx, "q", []CachedPage{{
+			URL: url, Title: "t", Content: strings.Repeat("x", 120),
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cache.Prune(ctx); err != nil {
+		t.Fatalf("清理失败: %v", err)
+	}
+
+	var total int64
+	if err := cache.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(size_bytes), 0) FROM web_cache`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total > 250 {
+		t.Fatalf("清理后仍超出容量: %d", total)
+	}
+	if _, ok, _ := cache.GetContent(ctx, urls[0]); ok {
+		t.Fatal("最久未使用的条目应被淘汰")
+	}
+}
+
+func TestNilCache(t *testing.T) {
+	var cache *Cache
+	ctx := context.Background()
+	if _, ok, err := cache.GetSummary(ctx, "https://example.com/a"); err != nil || ok {
+		t.Fatalf("nil 缓存应安全返回未命中: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := cache.GetContent(ctx, "https://example.com/a"); err != nil || ok {
+		t.Fatalf("nil 缓存应安全返回未命中: ok=%v err=%v", ok, err)
+	}
+	if err := cache.PutSearch(ctx, "q", []CachedPage{{URL: "https://example.com/a"}}); err != nil {
+		t.Fatalf("nil 缓存写入应安全: %v", err)
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatalf("nil 缓存关闭应安全: %v", err)
+	}
+}
