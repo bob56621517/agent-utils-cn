@@ -1,0 +1,292 @@
+openapi: "3.0.3"
+info:
+  title: "DeepSeek 网页搜索与抓取"
+  description: "Search 接口按 query 搜索网页并返回结构化结果，Fetch 接口抓取单个网页并以 Markdown 文本返回页面内容。两者均为只读请求，使用 DeepSeek API Key 的 Bearer 鉴权。Search 限速 100 QPS，Fetch 限速 25 QPS；每个接口每 1,000 次成功请求 5 元。"
+  version: "1.0.0"
+  license:
+    name: "MIT"
+    url: "https://opensource.org/license/mit"
+servers:
+  - url: "https://api.deepseek.com"
+security:
+  - bearerAuth: []
+paths:
+  "/v1/tools/search":
+    post:
+      summary: "网页搜索"
+      description: "按 query 搜索网页，返回结构化结果列表；没有匹配结果时返回空数组。支持 site:、-site:、lang:、after:、before:、精确短语等搜索语法。只读请求，按成功请求次数计费。"
+      operationId: "DeepseekSearch"
+      requestBody:
+        required: true
+        content:
+          "application/json":
+            schema:
+              "$ref": "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: "返回搜索结果"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/SearchResponse"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "402":
+          "$ref": "#/components/responses/PaymentRequired"
+        "408":
+          "$ref": "#/components/responses/RequestTimeout"
+        "413":
+          "$ref": "#/components/responses/PayloadTooLarge"
+        "429":
+          "$ref": "#/components/responses/TooManyRequests"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+        "504":
+          "$ref": "#/components/responses/GatewayTimeout"
+  "/v1/tools/fetch":
+    post:
+      summary: "网页抓取"
+      description: "抓取单个网页，返回页面标题与 Markdown 格式正文；结果受目标站点可用性和访问策略影响。只读请求，按成功请求次数计费。"
+      operationId: "DeepseekFetch"
+      requestBody:
+        required: true
+        content:
+          "application/json":
+            schema:
+              "$ref": "#/components/schemas/FetchRequest"
+      responses:
+        "200":
+          description: "返回抓取到的网页内容"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/FetchResponse"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "402":
+          "$ref": "#/components/responses/PaymentRequired"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "408":
+          "$ref": "#/components/responses/RequestTimeout"
+        "413":
+          "$ref": "#/components/responses/PayloadTooLarge"
+        "429":
+          "$ref": "#/components/responses/TooManyRequests"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+        "504":
+          "$ref": "#/components/responses/GatewayTimeout"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: "http"
+      scheme: "bearer"
+      description: "DeepSeek API Key"
+  schemas:
+    SearchRequest:
+      type: "object"
+      required:
+        - "query"
+      properties:
+        query:
+          type: "string"
+          minLength: 1
+          maxLength: 128
+          description: "搜索词，支持 site:、-site:、lang:、after:、before:、精确短语等搜索语法；不能全为空白。"
+        count:
+          type: "integer"
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: "返回结果条数，默认 10。"
+        ori_question:
+          type: "string"
+          nullable: true
+          minLength: 1
+          maxLength: 128
+          description: "触发本次搜索的用户原始问题，用于帮助理解搜索意图；传 null 视为未提供。"
+        localization:
+          type: "string"
+          default: ""
+          description: "用于优先返回本地化搜索结果的 IP 地址。"
+        need_content:
+          type: "boolean"
+          default: false
+          description: "是否在 content 中返回网页正文；为 false 时 content 恒为空字符串。"
+    SearchResponse:
+      type: "object"
+      required:
+        - "results"
+      properties:
+        results:
+          type: "array"
+          description: "搜索结果列表；没有匹配结果时为空数组。"
+          items:
+            "$ref": "#/components/schemas/SearchResult"
+    SearchResult:
+      type: "object"
+      required:
+        - "rerank_score"
+        - "title"
+        - "url"
+        - "snippet"
+        - "summary"
+        - "content"
+        - "site_name"
+        - "site_icon"
+        - "date"
+        - "authority"
+      properties:
+        rerank_score:
+          type: "number"
+          minimum: 0
+          maximum: 3
+          description: "综合相关性、权威性和时效性的排序分数，大于等于 1.5 为优质结果。"
+        title:
+          type: "string"
+          description: "结果标题。"
+        url:
+          type: "string"
+          format: "uri"
+          description: "结果链接。"
+        snippet:
+          type: "string"
+          description: "与 query 相关的短摘要，通常 100～200 字符，适合前端展示。"
+        summary:
+          type: "string"
+          description: "与 query 相关的长摘要，通常 600～800 字符，适合给模型阅读。"
+        content:
+          type: "string"
+          description: "网页正文；need_content 为 false 或正文缺失时为空字符串。"
+        site_name:
+          type: "string"
+          nullable: true
+          description: "站点名称；缺失时为 null。"
+        site_icon:
+          type: "string"
+          nullable: true
+          description: "站点图标 URL；缺失时为 null。"
+        date:
+          type: "string"
+          format: "date-time"
+          nullable: true
+          description: "发布时间，UTC 的 RFC 3339 格式；未知时为 null。"
+        authority:
+          type: "integer"
+          minimum: -1
+          maximum: 4
+          description: "网页权威性，0～4，-1 表示未知；大于等于 3 为极权威结果。"
+    FetchRequest:
+      type: "object"
+      required:
+        - "url"
+      properties:
+        url:
+          type: "string"
+          format: "uri"
+          minLength: 1
+          maxLength: 8192
+          description: "要抓取的网页地址，必须为包含主机名的 HTTP/HTTPS URL，且不能携带用户名或密码。"
+    FetchResponse:
+      type: "object"
+      required:
+        - "title"
+        - "content"
+      properties:
+        title:
+          type: "string"
+          description: "页面标题；缺失时为空字符串。"
+        content:
+          type: "string"
+          description: "抓取后的 Markdown 正文。"
+    Error:
+      type: "object"
+      required:
+        - "error"
+      properties:
+        error:
+          type: "object"
+          required:
+            - "message"
+            - "type"
+            - "param"
+            - "code"
+          properties:
+            message:
+              type: "string"
+            type:
+              type: "string"
+            param:
+              type: "string"
+              nullable: true
+              description: "恒为 null。"
+            code:
+              type: "string"
+  responses:
+    BadRequest:
+      description: "请求头或请求体不合法，包括 JSON 格式错误或字段值无效"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    Unauthorized:
+      description: "API Key 缺失或无效"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    PaymentRequired:
+      description: "账号余额不足"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    Forbidden:
+      description: "Fetch 请求被安全策略拒绝"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    NotFound:
+      description: "Fetch 未能获取可用的网页内容，例如 URL 不可用、被站点策略拦截、目标站点返回错误、内容类型不受支持或页面没有可提取的 Markdown 正文"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    RequestTimeout:
+      description: "读取请求体超时"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: "请求体超过大小限制"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    TooManyRequests:
+      description: "超过该接口的 QPS 限制"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    InternalServerError:
+      description: "服务器内部错误"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
+    GatewayTimeout:
+      description: "下游请求超时"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/Error"
